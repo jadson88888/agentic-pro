@@ -1,0 +1,74 @@
+name: Deployment Control
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Website state
+        type: choice
+        options: [disable, enable]
+        default: disable
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: pages-control
+  cancel-in-progress: false
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Determine state
+        id: state
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          python - <<'PY'
+          import json, os, time, pathlib
+          p=pathlib.Path('deployment-state.json')
+          state=json.loads(p.read_text()) if p.exists() else {'enabled':False,'expiresAt':0}
+          action=os.environ.get('ACTION')
+          now=int(time.time()*1000)
+          if action=='enable': state={'enabled':True,'expiresAt':now+14400000}
+          elif action=='disable' or (state['enabled'] and state['expiresAt']<=now): state={'enabled':False,'expiresAt':0}
+          else:
+              with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('changed=false\n')
+              raise SystemExit
+          p.write_text(json.dumps(state)+'\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('changed=true\n')
+          PY
+      - name: Save state
+        if: steps.state.outputs.changed == 'true'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add deployment-state.json
+          git diff --cached --quiet || git commit -m "Update deployment state"
+          git push origin HEAD:main
+      - name: Prepare site
+        if: steps.state.outputs.changed == 'true'
+        run: |
+          mkdir -p _site
+          cp deployment-state.json _site/
+          if python -c "import json; assert json.load(open('deployment-state.json'))['enabled']"; then
+            cp index.html _site/
+          else
+            cp closed.html _site/index.html
+          fi
+      - uses: actions/configure-pages@v5
+        if: steps.state.outputs.changed == 'true'
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.state.outputs.changed == 'true'
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
+        id: deploy
+        if: steps.state.outputs.changed == 'true'
